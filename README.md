@@ -47,7 +47,7 @@ Everything is procedural — graphics, icon, audio (synthesized putt/wall/sand/s
 
 ## Notes
 
-- Works across multiple extended displays — the course spans the union of all screens
+- Course lives on your main Mac screen — the ball bounces off the screen edges
 - Only the area right around the ball (~72px) is interactive; every other click passes through to the app below
 - Idles at 0 CPU when you're not playing
 

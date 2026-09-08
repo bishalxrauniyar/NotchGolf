@@ -221,22 +221,19 @@ final class GameView: NSView {
 
     override func acceptsFirstMouse(for n: NSEvent?) -> Bool { true }
 
-    // MARK: Hole generation — cup hangs under the notched display, course spans all screens
+    // MARK: Hole generation — course lives on the main Mac screen only
 
-    private var screensUnion: NSRect {
-        var u = NSRect.null
-        for s in NSScreen.screens { u = u.union(s.frame) }
-        if u.isEmpty { u = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1512, height: 982) }
-        return u
+    private var courseFrame: NSRect {
+        NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1512, height: 982)
     }
 
     private func buildHole() {
-        let u = screensUnion
-        let w = u.width, h = u.height
+        let f = courseFrame
+        let w = f.width, h = f.height
         sands = []; waters = []; bumpers = []
         strokes = 0
 
-        // cup moves every hole: wanders around the desktop, starts near the top on hole 1
+        // cup moves every hole: wanders around the desktop, moderate distance on hole 1
         let cupAngle = CGFloat(holeNum) * 2.4
         let cupRadius = holeNum == 1 ? 0.32 : 0.18 + 0.22 * (0.5 + 0.5 * cos(cupAngle * 0.7))
         cup = CGPoint(x: w * (0.5 + 0.36 * sin(cupAngle) * cupRadius),
@@ -678,16 +675,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private static let HANDLE: CGFloat = 170
 
-    private var screensUnion: NSRect {
-        var u = NSRect.null
-        for s in NSScreen.screens { u = u.union(s.frame) }
-        return u.isEmpty ? (NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1512, height: 982)) : u
+    private var courseFrame: NSRect {
+        NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1512, height: 982)
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        let union = screensUnion
+        let f = courseFrame
 
-        panel = Panel(contentRect: union, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = Panel(contentRect: f, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -697,7 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = false
         panel.ignoresMouseEvents = true // overlay never eats clicks
 
-        game = GameView(frame: NSRect(x: 0, y: 0, width: union.width, height: union.height))
+        game = GameView(frame: NSRect(x: 0, y: 0, width: f.width, height: f.height))
         game.wantsLayer = true
         game.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentView = game
@@ -752,9 +747,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func position() {
-        let u = screensUnion
-        panel.setFrame(u, display: true)
-        game.frame = NSRect(x: 0, y: 0, width: u.width, height: u.height)
+        let f = courseFrame
+        panel.setFrame(f, display: true)
+        game.frame = NSRect(x: 0, y: 0, width: f.width, height: f.height)
         game.rebuildForScreens()
         moveHandle()
     }
