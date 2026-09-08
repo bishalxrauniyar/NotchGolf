@@ -20,91 +20,106 @@ private extension CGColor {
     }
 }
 
-// MARK: - Procedural sound (no asset files)
+// MARK: - Procedural sound (in-memory WAV + AVAudioPlayer; no engine graph, exception-proof)
 
 final class SFX {
     static let shared = SFX()
-    private let engine = AVAudioEngine()
-    private var players: [AVAudioPlayerNode] = []
-    private var nextIdx = 0
-    private let sr: Double = 44100
+    private let sr = 44100
+    private var cache: [String: Data] = [:]
+    private var live: [AVAudioPlayer] = []
     var enabled: Bool { UserDefaults.standard.object(forKey: "notchgolf.sound") as? Bool ?? true }
 
-    private init() {
-        do {
-            try engine.start()
-            let fmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1)!
-            for _ in 0..<6 {
-                let p = AVAudioPlayerNode()
-                engine.attach(p)
-                engine.connect(p, to: engine.mainMixerNode, format: fmt)
-                p.play()
-                players.append(p)
-            }
-        } catch { }
+    private init() { }
+
+    private func wav(_ key: String, dur: Double, gen: (Double) -> Double) {
+        guard cache[key] == nil else { return }
+        let frames = Int(dur * Double(sr))
+        var pcm = Data(capacity: frames * 2)
+        for i in 0..<frames {
+            let v = Int16(max(-1, min(1, gen(Double(i) / Double(sr)))) * 32000)
+            withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
+        }
+        var d = Data()
+        func str(_ s: String) { d.append(s.data(using: .ascii)!) }
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        str("RIFF"); u32(UInt32(36 + pcm.count)); str("WAVE")
+        str("fmt "); u32(16); u16(1); u16(1); u32(UInt32(sr)); u32(UInt32(sr * 2)); u16(2); u16(16)
+        str("data"); u32(UInt32(pcm.count)); d.append(pcm)
+        cache[key] = d
     }
 
-    private func buffer(_ dur: Double, gen: (Double) -> Double) -> AVAudioPCMBuffer {
-        let frames = AVAudioFrameCount(dur * sr)
-        let fmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1)!
-        let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames)!
-        let data = b.floatChannelData![0]
-        for i in 0..<Int(frames) { data[i] = Float(gen(Double(i) / sr)) }
-        b.frameLength = frames
-        return b
-    }
-
-    private func play(_ b: AVAudioPCMBuffer, _ gain: Float) {
-        guard enabled, engine.isRunning else { return }
-        let p = players[nextIdx % players.count]
-        nextIdx += 1
+    private func play(_ key: String, _ gain: Float) {
+        guard enabled, let data = cache[key] else { return }
+        guard let p = try? AVAudioPlayer(data: data) else { return }
         p.volume = gain
-        p.scheduleBuffer(b, at: nil, options: .interrupts)
+        p.delegate = PlayerPool.shared
+        PlayerPool.shared.retain(p)
+        p.play()
+    }
+
+    // keeps weak-ish references until playback finishes so players aren't deallocated mid-sound
+    private final class PlayerPool: NSObject, AVAudioPlayerDelegate {
+        static let shared = PlayerPool()
+        private var players: [AVAudioPlayer] = []
+        func retain(_ p: AVAudioPlayer) {
+            players.append(p)
+            if players.count > 24 { players.removeAll { !$0.isPlaying } }
+        }
+        func audioPlayerDidFinishPlaying(_ p: AVAudioPlayer, successfully flag: Bool) {
+            players.removeAll { $0 === p }
+        }
     }
 
     func putt(_ power: Double) {
-        play(buffer(0.07) { t in
+        wav("putt", dur: 0.07) { t in
             Double.random(in: -0.5...0.5) * exp(-t * 90) * 0.7
             + sin(2 * .pi * 1100 * t) * exp(-t * 140) * 0.25
-        }, Float(0.3 + 0.5 * power))
+        }
+        play("putt", Float(0.25 + 0.5 * power))
     }
 
     func wall() {
-        play(buffer(0.09) { t in
+        wav("wall", dur: 0.09) { t in
             sin(2 * .pi * 175 * t) * exp(-t * 32) * 0.7
             + Double.random(in: -0.5...0.5) * exp(-t * 110) * 0.2
-        }, 0.8)
+        }
+        play("wall", 0.7)
     }
 
     func sand() {
         var lp = 0.0
-        play(buffer(0.16) { t in
+        wav("sand", dur: 0.16) { t in
             let x = Double.random(in: -0.5...0.5)
             lp += 0.06 * (x - lp)
             return lp * exp(-t * 20) * 3.4
-        }, 0.7)
+        }
+        play("sand", 0.6)
     }
 
     func sink() {
         var phase = 0.0
-        play(buffer(0.28) { t in
+        wav("sink", dur: 0.28) { t in
             let f = max(720 - 1500 * t, 240)
-            phase += 2 * .pi * f / self.sr
+            phase += 2 * .pi * f / 44100.0
             return sin(phase) * exp(-t * 11) * 0.8
-        }, 0.85)
+        }
+        play("sink", 0.75)
     }
 
     func splash() {
         var lp = 0.0
-        play(buffer(0.4) { t in
+        wav("splash", dur: 0.4) { t in
             let x = Double.random(in: -0.5...0.5)
             lp += 0.14 * (x - lp)
             return lp * exp(-t * 8) * 2.6
-        }, 0.8)
+        }
+        play("splash", 0.7)
     }
 
     func fanfare(_ notes: [Double], step: Double) {
-        play(buffer(1.0) { t in
+        var lastKey = ""
+        wav("fan\(notes.count)-\(Int(step * 100))", dur: 1.0) { t in
             var s = 0.0
             for (i, f) in notes.enumerated() {
                 let tt = t - Double(i) * step
@@ -113,7 +128,9 @@ final class SFX {
                 }
             }
             return s
-        }, 0.85)
+        }
+        lastKey = "fan\(notes.count)-\(Int(step * 100))"
+        play(lastKey, 0.75)
     }
 }
 
@@ -543,10 +560,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
-        let w: CGFloat = 380, h: CGFloat = 220
+        let notch = notchRect(on: screen)
 
-        panel = Panel(contentRect: NSRect(x: screen.frame.midX - w / 2, y: screen.frame.maxY - h, width: w, height: h),
-                      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = Panel(contentRect: notch, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -556,10 +572,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = false
         panel.ignoresMouseEvents = false
 
-        game = GameView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        game = GameView(frame: NSRect(x: 0, y: 0, width: notch.width, height: notch.height))
         game.wantsLayer = true
         game.layer?.backgroundColor = NSColor.clear.cgColor
-        game.layer?.cornerRadius = 16
+        game.layer?.cornerRadius = 10
         game.layer?.masksToBounds = true
         panel.contentView = game
         panel.orderFrontRegardless()
@@ -588,9 +604,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                object: nil, queue: .main) { [weak self] _ in self?.position() }
     }
 
+    private func notchRect(on screen: NSScreen) -> NSRect {
+        let f = screen.frame
+        let top = screen.safeAreaInsets.top // includes menu bar + notch (0 on notchless Macs)
+        let menuH = NSStatusBar.system.thickness
+        let notchW: CGFloat = max(top > menuH + 1 ? screen.safeAreaInsets.left * 2 + 0 : 0, 185)
+        let probeH = top + 4
+        // measure the notch: walk the menu-bar strip for the dark gap in the screen screenshot-free way:
+        // safeAreaInsets on notched Macs = menu bar height; the notch width isn't exposed, so use Apple's 185–240pt range
+        let width = top > menuH + 1 ? notchWForScreen(f.width) : 185
+        return NSRect(x: f.midX - width / 2, y: f.maxY - top + 1, width: width, height: probeH - 2)
+    }
+
+    private func notchWForScreen(_ logicalWidth: CGFloat) -> CGFloat {
+        // 14" ≈ 1512pt → ~200pt notch; 16" ≈ 1728pt → ~220pt notch
+        logicalWidth >= 1700 ? 220 : 200
+    }
+
     private func position() {
         let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
-        panel.setFrameTopLeftPoint(NSPoint(x: screen.frame.midX - panel.frame.width / 2, y: screen.frame.maxY))
+        let notch = notchRect(on: screen)
+        panel.setFrame(notch, display: true)
     }
 
     @objc private func toggleMenu() { toggle() }
@@ -600,7 +634,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu?.items.first(where: { $0.title == "Sound" })?.state = v ? .on : .off
     }
     @objc private func restart() { game.newRound() }
-
     private func toggle() {
         if panel.isVisible { panel.orderOut(nil) } else { position(); panel.orderFrontRegardless() }
     }
