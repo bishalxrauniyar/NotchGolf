@@ -26,7 +26,6 @@ final class SFX {
     static let shared = SFX()
     private let sr = 44100
     private var cache: [String: Data] = [:]
-    private var live: [AVAudioPlayer] = []
     var enabled: Bool { UserDefaults.standard.object(forKey: "notchgolf.sound") as? Bool ?? true }
 
     private init() { }
@@ -58,7 +57,6 @@ final class SFX {
         p.play()
     }
 
-    // keeps weak-ish references until playback finishes so players aren't deallocated mid-sound
     private final class PlayerPool: NSObject, AVAudioPlayerDelegate {
         static let shared = PlayerPool()
         private var players: [AVAudioPlayer] = []
@@ -118,8 +116,8 @@ final class SFX {
     }
 
     func fanfare(_ notes: [Double], step: Double) {
-        var lastKey = ""
-        wav("fan\(notes.count)-\(Int(step * 100))", dur: 1.0) { t in
+        let key = "fan\(notes.count)-\(Int(step * 100))"
+        wav(key, dur: 1.0) { t in
             var s = 0.0
             for (i, f) in notes.enumerated() {
                 let tt = t - Double(i) * step
@@ -129,8 +127,7 @@ final class SFX {
             }
             return s
         }
-        lastKey = "fan\(notes.count)-\(Int(step * 100))"
-        play(lastKey, 0.75)
+        play(key, 0.75)
     }
 }
 
@@ -150,17 +147,20 @@ enum HotKey {
     }
 }
 
-// MARK: - Game
+// MARK: - Game: full-screen transparent overlay, only the course elements are drawn
 
 final class GameView: NSView {
     private enum Phase { case aim, roll, sink, holeOver }
 
-    private static let BR: CGFloat = 7          // ball radius
-    private static let CUPR: CGFloat = 11       // cup radius
-    private static let REST: CGFloat = 0.72     // wall restitution
-    private static let MAXDRAG: CGFloat = 110   // max drag length (px)
-    private static let MAXSPEED: CGFloat = 1050 // max launch speed (px/s)
-    private static let CATCH: CGFloat = 420     // max speed the cup swallows
+    private static let BR: CGFloat = 8           // ball radius
+    private static let CUPR: CGFloat = 13        // cup radius
+    private static let REST: CGFloat = 0.72      // wall restitution
+    private static let GRAB: CGFloat = 48        // grab radius around the ball
+    private static let MAXDRAG: CGFloat = 190    // max drag length (px)
+    private static let MAXSPEED: CGFloat = 2300  // max launch speed (px/s)
+    private static let CATCH: CGFloat = 540      // max speed the cup swallows
+    private static let FRICTION: CGFloat = 1.55
+    private static let SANDFRICTION: CGFloat = 5.0
 
     private var phase: Phase = .aim
     private var holeNum = 1
@@ -191,82 +191,71 @@ final class GameView: NSView {
     private var bannerUntil: CFTimeInterval = 0
 
     private var link: CADisplayLink?
-    private var isPaused = false
-
-    // Peek/expand UI: collapsed = mini view inside the notch; tapping expands downward
-    var collapsed = true
-    var onExpand: (() -> Void)?
-    var onCollapse: (() -> Void)?
 
     override var isOpaque: Bool { false }
     override var mouseDownCanMoveWindow: Bool { false }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        // rebuild hole layout for the new size, unless mid-shot
-        if phase == .aim || phase == .holeOver {
-            buildHole()
-            ball = tee
-            vel = .zero
-        }
-        needsDisplay = true
-    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         buildHole()
         ball = tee
-        let l = viewDisplayLink(selector: #selector(tick(_:)))
-        l.isPaused = true
+        let l = makeDisplayLink(selector: #selector(tick(_:)))
         l.add(to: .main, forMode: .common)
         link = l
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    private func viewDisplayLink(selector: Selector) -> CADisplayLink {
+    private func makeDisplayLink(selector: Selector) -> CADisplayLink {
         if #available(macOS 14.0, *) {
             return displayLink(target: self, selector: selector)
         }
-        let l = CADisplayLink()
-        l.isPaused = true
-        return l
+        fatalError("NotchGolf requires macOS 14+")
     }
 
-    // MARK: Hole generation (formulaic, deterministic per hole number)
+    // Only the ball is interactive — every other click falls through to apps below
+    override func hitTest(_ p: NSPoint) -> NSView? {
+        guard let sup = superview else { return nil }
+        let local = convert(p, from: sup)
+        if phase == .aim && local.dist(to: ball) < Self.GRAB { return self }
+        return nil
+    }
+
+    override func resetCursorRects() {
+        if phase == .aim {
+            addCursorRect(CGRect(x: ball.x - Self.GRAB, y: ball.y - Self.GRAB,
+                                 width: Self.GRAB * 2, height: Self.GRAB * 2), cursor: .openHand)
+        }
+    }
+
+    // MARK: Hole generation — cup hangs under the notch, ball lands somewhere on the desktop
 
     private func buildHole() {
         let w = bounds.width, h = bounds.height
         sands = []; waters = []; bumpers = []
         strokes = 0
 
-        // Layout adapts: collapsed peek = horizontal strip; expanded = full mini-golf below the notch
-        if h < 60 {
-            tee = CGPoint(x: w * 0.18, y: h * 0.55)
-            cup = CGPoint(x: w * 0.85, y: h * 0.5)
-        } else {
-            tee = CGPoint(x: w * 0.12, y: h * 0.62)
-            cup = CGPoint(x: w * 0.86, y: h * 0.5)
-        }
+        cup = CGPoint(x: w * 0.5, y: h - 46)
+
+        let ang = CGFloat(holeNum) * 1.9
+        tee = CGPoint(x: w * (0.28 + 0.44 * (0.5 + 0.5 * sin(ang))),
+                      y: h * (0.22 + 0.4 * (0.5 + 0.5 * cos(ang * 1.3))))
 
         par = holeNum <= 1 ? 2 : (holeNum <= 3 ? 3 : 4)
 
-        let count = min(holeNum / 2, 4)
+        let count = min(holeNum / 2 + 1, 6)
         for i in 0..<count {
-            let ang = CGFloat(i + 1) * 1.1
-            let cx = w * (0.42 + 0.09 * sin(ang))
-            let cy = h * (0.5 + 0.26 * cos(ang * 1.7))
-            if i.isMultiple(of: 2) {
-                sands.append((CGPoint(x: cx, y: cy), min(24 + CGFloat(holeNum) * 1.5, 32)))
+            let a = CGFloat(i + 1) * 1.7 + CGFloat(holeNum) * 0.9
+            let cx = w * (0.15 + 0.7 * (0.5 + 0.5 * sin(a)))
+            let cy = h * (0.14 + 0.6 * (0.5 + 0.5 * cos(a * 2.1)))
+            if hypot(cx - cup.x, cy - cup.y) < 110 { continue }
+            if hypot(cx - tee.x, cy - tee.y) < 90 { continue }
+            if i.isMultiple(of: 3) {
+                bumpers.append((CGPoint(x: cx, y: cy), 17))
+            } else if i.isMultiple(of: 2) {
+                sands.append((CGPoint(x: cx, y: cy), min(28 + CGFloat(holeNum) * 1.6, 44)))
             } else {
-                bumpers.append((CGPoint(x: cx, y: cy), 14))
+                waters.append(CGRect(x: cx - 70, y: cy - 14, width: 140, height: 28))
             }
-        }
-        if holeNum >= 3 {
-            let wy = h * (holeNum.isMultiple(of: 2) ? 0.32 : 0.68)
-            waters = [CGRect(x: w * 0.45, y: wy - 9, width: w * 0.22, height: 18)]
-        }
-        if holeNum >= 5 {
-            bumpers.append((CGPoint(x: w * 0.62, y: h * 0.5), 13))
         }
     }
 
@@ -277,6 +266,7 @@ final class GameView: NSView {
         vel = .zero
         sinkT = 0
         phase = .aim
+        needsDisplay = true
     }
 
     // MARK: Loop
@@ -288,7 +278,7 @@ final class GameView: NSView {
         dt = min(dt, 0.05)
 
         if phase == .roll {
-            let sub = 4
+            let sub = 6
             let h = CGFloat(dt / Double(sub))
             for _ in 0..<sub where phase == .roll { integrate(h) }
         } else if phase == .sink {
@@ -309,7 +299,7 @@ final class GameView: NSView {
         var v = vel
 
         let inSand = sands.contains { $0.0.dist(to: p) < $0.1 }
-        let damp = CGFloat(exp(-Double((inSand ? 4.2 : 1.15) * h)))
+        let damp = CGFloat(exp(-Double((inSand ? Self.SANDFRICTION : Self.FRICTION) * h)))
         v = v * damp
         if inSand && !sands.contains(where: { $0.0.dist(to: ball) < $0.1 }) { SFX.shared.sand() }
 
@@ -351,7 +341,7 @@ final class GameView: NSView {
             return
         }
 
-        if v.len < 9 {
+        if v.len < 11 {
             vel = .zero
             ball = p
             phase = .aim
@@ -403,20 +393,12 @@ final class GameView: NSView {
     override func mouseDown(with e: NSEvent) {
         lastT = CACurrentMediaTime()
         link?.isPaused = false
-        let p = convert(e.locationInWindow, from: nil)
-
-        if collapsed {
-            onExpand?()
-            return
-        }
-        // grip at top-center of expanded panel collapses back into the notch
-        if p.y > bounds.height - 20 && abs(p.x - bounds.midX) < 36 {
-            onCollapse?()
-            return
-        }
-        if phase == .holeOver { nextHole(); return }
         guard phase == .aim else { return }
-        if p.dist(to: ball) < 34 { drag = p }
+        let p = convert(e.locationInWindow, from: nil)
+        if p.dist(to: ball) < Self.GRAB {
+            drag = p
+            NSCursor.closedHand.push()
+        }
     }
 
     override func mouseDragged(with e: NSEvent) {
@@ -426,11 +408,12 @@ final class GameView: NSView {
     }
 
     override func mouseUp(with e: NSEvent) {
+        NSCursor.pop()
         guard phase == .aim, let d = drag else { return }
         drag = nil
         let pull = ball - d
         let dist = min(pull.len, Self.MAXDRAG)
-        guard dist > 8 else { needsDisplay = true; return }
+        guard dist > 10 else { needsDisplay = true; return }
         preShot = ball
         vel = pull.norm * (Self.MAXSPEED * (dist / Self.MAXDRAG))
         strokes += 1
@@ -439,83 +422,85 @@ final class GameView: NSView {
         needsDisplay = true
     }
 
-    // MARK: Drawing
+    // MARK: Drawing — transparent, only course elements
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let g = bounds
         let t = CACurrentMediaTime()
+        ctx.clear(g)
 
-        if collapsed {
-            drawPeek(ctx, g, t)
-            return
-        }
-
-        ctx.setFillColor(CGColor.rgb(0.07, 0.09, 0.08))
-        ctx.fill(g)
-        ctx.setFillColor(CGColor.rgb(0.11, 0.4, 0.21))
-        ctx.fill(g.insetBy(dx: 3, dy: 3))
-        ctx.setFillColor(CGColor.rgb(1, 1, 1, 0.035))
-        var x: CGFloat = 3
-        while x < g.maxX - 3 { ctx.fill(CGRect(x: x, y: g.minY + 3, width: 11, height: g.height - 6)); x += 22 }
-
+        // water patches — translucent, floating on the desktop
         for r in waters {
-            ctx.setFillColor(CGColor.rgb(0.15, 0.4, 0.75, 0.92))
-            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 8, cornerHeight: 8, transform: nil))
+            ctx.setFillColor(CGColor.rgb(0.2, 0.5, 0.9, 0.35))
+            ctx.addPath(CGPath(roundedRect: r, cornerWidth: 12, cornerHeight: 12, transform: nil))
             ctx.fillPath()
-            ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.25))
+            ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.3))
             ctx.setLineWidth(1)
-            ctx.move(to: CGPoint(x: r.minX + 6, y: r.midY + sin(t * 2 + 1) * 1.5))
-            ctx.addLine(to: CGPoint(x: r.maxX - 6, y: r.midY + sin(t * 2) * 1.5))
+            ctx.move(to: CGPoint(x: r.minX + 8, y: r.midY + sin(t * 2 + 1) * 2))
+            ctx.addLine(to: CGPoint(x: r.maxX - 8, y: r.midY + sin(t * 2) * 2))
             ctx.strokePath()
         }
 
+        // sand traps
         for (c, r) in sands {
-            ctx.setFillColor(CGColor.rgb(0.87, 0.76, 0.45))
+            ctx.setFillColor(CGColor.rgb(0.9, 0.8, 0.5, 0.4))
             ctx.fillEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
-            ctx.setStrokeColor(CGColor.rgb(0.6, 0.48, 0.22, 0.6))
+            ctx.setStrokeColor(CGColor.rgb(0.75, 0.62, 0.3, 0.5))
             ctx.setLineWidth(1.5)
             ctx.strokeEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
         }
 
+        // bumpers
         for (c, r) in bumpers {
-            ctx.setFillColor(CGColor.rgb(0.9, 0.25, 0.3))
+            ctx.setFillColor(CGColor.rgb(1, 0.3, 0.35, 0.55))
             ctx.fillEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
-            ctx.setFillColor(CGColor.rgb(1, 1, 1, 0.3))
-            ctx.fillEllipse(in: CGRect(x: c.x - r * 0.45, y: c.y - r * 0.45, width: r * 0.55, height: r * 0.55))
+            ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.4))
+            ctx.setLineWidth(1.5)
+            ctx.strokeEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
         }
 
-        ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.35))
-        ctx.setLineWidth(1.5)
-        ctx.strokeEllipse(in: CGRect(x: tee.x - 11, y: tee.y - 11, width: 22, height: 22))
-
-        ctx.setFillColor(CGColor.rgb(0.02, 0.02, 0.02))
+        // the cup hangs just below the notch
+        ctx.setFillColor(CGColor.rgb(0, 0, 0, 0.75))
         ctx.fillEllipse(in: CGRect(x: cup.x - Self.CUPR, y: cup.y - Self.CUPR, width: Self.CUPR * 2, height: Self.CUPR * 2))
-        ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.22 + 0.12 * CGFloat(sin(t * 2.6))))
+        ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.55 + 0.25 * CGFloat(sin(t * 2.6))))
         ctx.setLineWidth(2)
         ctx.strokeEllipse(in: CGRect(x: cup.x - Self.CUPR - 4, y: cup.y - Self.CUPR - 4, width: (Self.CUPR + 4) * 2, height: (Self.CUPR + 4) * 2))
 
-        let fy = cup.y - 26
+        // flag
+        let fy = cup.y - 30
         ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.9))
         ctx.setLineWidth(2)
         ctx.move(to: cup); ctx.addLine(to: CGPoint(x: cup.x, y: fy)); ctx.strokePath()
         let flag = CGMutablePath()
         flag.move(to: CGPoint(x: cup.x, y: fy))
-        flag.addLine(to: CGPoint(x: cup.x + 15, y: fy + 5))
-        flag.addLine(to: CGPoint(x: cup.x, y: fy + 11))
+        flag.addLine(to: CGPoint(x: cup.x + 17, y: fy + 6))
+        flag.addLine(to: CGPoint(x: cup.x, y: fy + 12))
         flag.closeSubpath()
-        ctx.setFillColor(CGColor.rgb(1, 0.32, 0.28))
+        ctx.setFillColor(CGColor.rgb(1, 0.32, 0.28, 0.95))
         ctx.addPath(flag); ctx.fillPath()
 
+        // score chip under the cup
+        let chip = "H\(holeNum) · Par \(par) · Str \(strokes) · Tot \(fmt(totalDiff))" + (best.map { " · Best \(fmt($0))" } ?? "")
+        let chipAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.8),
+            .shadow: shadow(),
+        ]
+        let cs = (chip as NSString).size(withAttributes: chipAttrs)
+        (chip as NSString).draw(at: CGPoint(x: cup.x - cs.width / 2, y: cup.y + Self.CUPR + 12), withAttributes: chipAttrs)
+
+        // splash rings
         if splashT > 0, let sp = splashAt {
-            ctx.setStrokeColor(CGColor.rgb(1, 1, 1, splashT * 0.7))
+            ctx.setStrokeColor(CGColor.rgb(0.85, 0.92, 1, splashT * 0.8))
             ctx.setLineWidth(2)
             for i in 0..<3 {
-                let rr = (1 - splashT) * 34 + CGFloat(i) * 9
+                let rr = (1 - splashT) * 40 + CGFloat(i) * 11
                 ctx.strokeEllipse(in: CGRect(x: sp.x - rr, y: sp.y - rr, width: rr * 2, height: rr * 2))
             }
         }
 
+        // aim: pull-back line + power ring
         if phase == .aim, let d = drag {
             let pull = ball - d
             let dist = min(pull.len, Self.MAXDRAG)
@@ -523,92 +508,72 @@ final class GameView: NSView {
                 let power = dist / Self.MAXDRAG
                 let col = NSColor(hue: CGFloat(0.33 - 0.33 * power), saturation: 0.85, brightness: 1, alpha: 1)
                 let dir = pull.norm
+                ctx.setShadow(offset: .zero, blur: 6, color: NSColor.black.withAlphaComponent(0.5).cgColor)
                 ctx.setStrokeColor(col.cgColor)
-                ctx.setLineWidth(3)
+                ctx.setLineWidth(4)
                 ctx.setLineCap(.round)
-                ctx.move(to: ball + dir * (Self.BR + 4))
-                ctx.addLine(to: ball + dir * (dist * 0.9 + Self.BR + 4))
+                ctx.move(to: ball + dir * (Self.BR + 5))
+                ctx.addLine(to: ball + dir * (dist * 0.9 + Self.BR + 5))
                 ctx.strokePath()
-                ctx.setStrokeColor(col.cgColor.copy(alpha: 0.5)!)
+                ctx.setStrokeColor(col.cgColor.copy(alpha: 0.6)!)
                 ctx.setLineWidth(2)
-                let rr = Self.BR + 8 + power * 6
+                let rr = Self.BR + 10 + power * 8
                 ctx.strokeEllipse(in: CGRect(x: ball.x - rr, y: ball.y - rr, width: rr * 2, height: rr * 2))
+                ctx.setShadow(offset: .zero, blur: 0, color: nil)
             }
         }
 
+        // ball with soft drop shadow
         if phase != .holeOver {
             let bR = phase == .sink ? Self.BR * max(0.08, 1 - sinkT) : Self.BR
             let bp = phase == .sink ? sinkFrom + (cup - sinkFrom) * min(sinkT, 1) : ball
-            ctx.setFillColor(CGColor.rgb(0.97, 0.97, 0.95))
+            ctx.setShadow(offset: CGSize(width: 0, height: -3), blur: 7, color: NSColor.black.withAlphaComponent(0.45).cgColor)
+            ctx.setFillColor(CGColor.rgb(0.98, 0.98, 0.96))
             ctx.fillEllipse(in: CGRect(x: bp.x - bR, y: bp.y - bR, width: bR * 2, height: bR * 2))
-            ctx.setFillColor(CGColor.rgb(0.55, 0.55, 0.52, 0.6))
-            ctx.fillEllipse(in: CGRect(x: bp.x - bR * 0.6, y: bp.y - bR * 0.6, width: bR * 0.55, height: bR * 0.55))
+            ctx.setShadow(offset: .zero, blur: 0, color: nil)
+            ctx.setFillColor(CGColor.rgb(0.55, 0.55, 0.52, 0.7))
+            ctx.fillEllipse(in: CGRect(x: bp.x - bR * 0.62, y: bp.y - bR * 0.62, width: bR * 0.55, height: bR * 0.55))
         }
 
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.92),
-        ]
-        let line = "Hole \(holeNum) · Par \(par) · Str \(strokes) · Tot \(fmt(totalDiff))"
-        (line as NSString).draw(at: CGPoint(x: 8, y: g.maxY - 18), withAttributes: attrs)
-        if let b = best {
-            let bt = "Best \(fmt(b))" as NSString
-            let bw = bt.size(withAttributes: attrs).width
-            bt.draw(at: CGPoint(x: g.maxX - 8 - bw, y: g.maxY - 18), withAttributes: attrs)
-        }
+        // first-hole hint near the ball
         if holeNum == 1 && strokes == 0 && phase == .aim && drag == nil {
-            let hint = "drag from the ball, release to putt" as NSString
+            let hint = "grab the ball · pull back · release to putt" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.5 + 0.2 * CGFloat(sin(t * 2))),
+                .shadow: shadow(),
+            ]
             let hw = hint.size(withAttributes: attrs).width
-            hint.draw(at: CGPoint(x: (g.width - hw) / 2, y: 10), withAttributes: [
-                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.45 + 0.2 * CGFloat(sin(t * 2))),
-            ])
+            hint.draw(at: CGPoint(x: ball.x - hw / 2, y: ball.y + 30), withAttributes: attrs)
         }
 
+        // banner floats mid-screen
         if CACurrentMediaTime() < bannerUntil {
             let age = CACurrentMediaTime() - bannerStart
             let a = CGFloat(min(1, age * 6))
             let big: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 23, weight: .heavy),
+                .font: NSFont.systemFont(ofSize: 34, weight: .heavy),
                 .foregroundColor: NSColor.white.withAlphaComponent(a),
+                .shadow: shadow(),
             ]
             let sm: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(a * 0.8),
+                .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(a * 0.85),
+                .shadow: shadow(),
             ]
             let bs = (bannerText as NSString).size(withAttributes: big)
-            (bannerText as NSString).draw(at: CGPoint(x: (g.width - bs.width) / 2, y: g.midY + 2), withAttributes: big)
+            (bannerText as NSString).draw(at: CGPoint(x: (g.width - bs.width) / 2, y: g.midY + 6), withAttributes: big)
             let ss = (bannerSub as NSString).size(withAttributes: sm)
-            (bannerSub as NSString).draw(at: CGPoint(x: (g.width - ss.width) / 2, y: g.midY - 16), withAttributes: sm)
+            (bannerSub as NSString).draw(at: CGPoint(x: (g.width - ss.width) / 2, y: g.midY - 22), withAttributes: sm)
         }
     }
 
-    // Mini fairway drawn when collapsed inside the notch
-    private func drawPeek(_ ctx: CGContext, _ g: CGRect, _ t: CFTimeInterval) {
-        ctx.setFillColor(CGColor.rgb(0.02, 0.02, 0.02))
-        ctx.fill(g)
-        ctx.setFillColor(CGColor.rgb(0.11, 0.4, 0.21))
-        ctx.fill(g.insetBy(dx: 2, dy: 2))
-
-        ctx.setFillColor(CGColor.rgb(0.02, 0.02, 0.02))
-        ctx.fillEllipse(in: CGRect(x: cup.x - 5, y: cup.y - 5, width: 10, height: 10))
-        ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.9))
-        ctx.setLineWidth(1.5)
-        ctx.move(to: CGPoint(x: cup.x, y: cup.y - 4))
-        ctx.addLine(to: CGPoint(x: cup.x, y: cup.y - 16))
-        ctx.strokePath()
-        ctx.setFillColor(CGColor.rgb(1, 0.32, 0.28))
-        ctx.fill(CGRect(x: cup.x, y: cup.y - 16, width: 8, height: 5))
-
-        let pulse = CGFloat(1 + 0.15 * sin(t * 3))
-        ctx.setFillColor(CGColor.rgb(0.97, 0.97, 0.95))
-        ctx.fillEllipse(in: CGRect(x: ball.x - 5 * pulse, y: ball.y - 5 * pulse, width: 10 * pulse, height: 10 * pulse))
-
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.85),
-        ]
-        ("H\(holeNum) \(fmt(totalDiff))" as NSString).draw(at: CGPoint(x: 6, y: 3), withAttributes: attrs)
+    private func shadow() -> NSShadow {
+        let s = NSShadow()
+        s.shadowBlurRadius = 4
+        s.shadowOffset = CGSize(width: 0, height: -2)
+        s.shadowColor = NSColor.black.withAlphaComponent(0.6)
+        return s
     }
 }
 
@@ -625,9 +590,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
-        let notch = notchRect(on: screen)
 
-        panel = Panel(contentRect: notch, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = Panel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -637,14 +601,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = false
         panel.ignoresMouseEvents = false
 
-        game = GameView(frame: NSRect(x: 0, y: 0, width: notch.width, height: notch.height))
+        game = GameView(frame: NSRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height))
         game.wantsLayer = true
         game.layer?.backgroundColor = NSColor.clear.cgColor
-        game.layer?.cornerRadius = 10
-        game.layer?.masksToBounds = true
-        game.collapsed = true
-        game.onExpand = { [weak self] in self?.expand() }
-        game.onCollapse = { [weak self] in self?.collapse() }
         panel.contentView = game
         panel.orderFrontRegardless()
 
@@ -672,38 +631,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                object: nil, queue: .main) { [weak self] _ in self?.position() }
     }
 
-    private func notchRect(on screen: NSScreen) -> NSRect {
-        let f = screen.frame
-        let top = screen.safeAreaInsets.top // menu bar + notch height
-        let width = top > NSStatusBar.system.thickness + 1 ? notchWForScreen(f.width) : 185
-        return NSRect(x: f.midX - width / 2, y: f.maxY - top + 1, width: width, height: top - 2)
-    }
-
-    private func notchWForScreen(_ logicalWidth: CGFloat) -> CGFloat {
-        logicalWidth >= 1700 ? 220 : 200
-    }
-
-    private func expandedRect(on screen: NSScreen) -> NSRect {
-        let f = screen.frame
-        let notch = notchRect(on: screen)
-        let h: CGFloat = 300
-        return NSRect(x: notch.midX - notch.width / 2, y: f.maxY - h, width: notch.width, height: h)
-    }
-
-    private func expand() {
-        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main else { return }
-        game.collapsed = false
-        game.needsDisplay = true
-        panel.setFrame(expandedRect(on: screen), display: true, animate: true)
-        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
-    }
-
-    private func collapse() {
-        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main else { return }
-        game.collapsed = true
-        game.needsDisplay = true
-        panel.setFrame(notchRect(on: screen), display: true, animate: true)
-        game.newRound()
+    private func position() {
+        guard let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main else { return }
+        panel.setFrame(screen.frame, display: true)
+        game.frame = NSRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height)
     }
 
     @objc private func toggleMenu() { toggle() }
@@ -713,12 +644,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu?.items.first(where: { $0.title == "Sound" })?.state = v ? .on : .off
     }
     @objc private func restart() { game.newRound() }
-
-    private func position() {
-        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main else { return }
-        let rect = game.collapsed ? notchRect(on: screen) : expandedRect(on: screen)
-        panel.setFrame(rect, display: true)
-    }
 
     private func toggle() {
         if panel.isVisible { panel.orderOut(nil) } else { position(); panel.orderFrontRegardless() }
