@@ -152,14 +152,14 @@ enum HotKey {
 final class GameView: NSView {
     private enum Phase { case aim, roll, sink, holeOver }
 
-    private static let BR: CGFloat = 8           // ball radius
-    private static let CUPR: CGFloat = 13        // cup radius
+    private static let BR: CGFloat = 16          // ball radius (2x)
+    private static let CUPR: CGFloat = 26        // cup radius (2x)
     private static let REST: CGFloat = 0.72      // wall restitution
-    private static let GRAB: CGFloat = 48        // grab radius around the ball
-    private static let MAXDRAG: CGFloat = 190    // max drag length (px)
-    private static let MAXSPEED: CGFloat = 2300  // max launch speed (px/s)
-    private static let CATCH: CGFloat = 540      // max speed the cup swallows
-    private static let FRICTION: CGFloat = 1.55
+    private static let GRAB: CGFloat = 72        // grab radius around the ball
+    private static let MAXDRAG: CGFloat = 300    // max drag length (px)
+    private static let MAXSPEED: CGFloat = 3200  // max launch speed (px/s)
+    private static let CATCH: CGFloat = 620      // max speed the cup swallows
+    private static let FRICTION: CGFloat = 1.45
     private static let SANDFRICTION: CGFloat = 5.0
 
     private var phase: Phase = .aim
@@ -184,6 +184,8 @@ final class GameView: NSView {
     private var splashAt: CGPoint?
     private var splashT: CGFloat = 0
     private var lastT: CFTimeInterval = 0
+    private var seqActive = false
+    private var monitors: [Any] = []
 
     private var bannerText = ""
     private var bannerSub = ""
@@ -219,18 +221,30 @@ final class GameView: NSView {
 
     override func acceptsFirstMouse(for n: NSEvent?) -> Bool { true }
 
-    // MARK: Hole generation — cup hangs under the notch, ball lands somewhere on the desktop
+    // MARK: Hole generation — cup hangs under the notched display, course spans all screens
+
+    private var screensUnion: NSRect {
+        var u = NSRect.null
+        for s in NSScreen.screens { u = u.union(s.frame) }
+        if u.isEmpty { u = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1512, height: 982) }
+        return u
+    }
 
     private func buildHole() {
-        let w = bounds.width, h = bounds.height
+        let u = screensUnion
+        let w = u.width, h = u.height
         sands = []; waters = []; bumpers = []
         strokes = 0
 
-        cup = CGPoint(x: w * 0.5, y: h - 46)
+        // cup moves every hole: wanders around the desktop, starts near the top on hole 1
+        let cupAngle = CGFloat(holeNum) * 2.4
+        let cupRadius = holeNum == 1 ? 0.32 : 0.18 + 0.22 * (0.5 + 0.5 * cos(cupAngle * 0.7))
+        cup = CGPoint(x: w * (0.5 + 0.36 * sin(cupAngle) * cupRadius),
+                      y: h * (0.55 + 0.38 * cupRadius * cos(cupAngle * 1.3)))
 
         let ang = CGFloat(holeNum) * 1.9
         tee = CGPoint(x: w * (0.28 + 0.44 * (0.5 + 0.5 * sin(ang))),
-                      y: h * (0.22 + 0.4 * (0.5 + 0.5 * cos(ang * 1.3))))
+                      y: h * (0.18 + 0.42 * (0.5 + 0.5 * cos(ang * 1.3))))
 
         par = holeNum <= 1 ? 2 : (holeNum <= 3 ? 3 : 4)
 
@@ -239,14 +253,14 @@ final class GameView: NSView {
             let a = CGFloat(i + 1) * 1.7 + CGFloat(holeNum) * 0.9
             let cx = w * (0.15 + 0.7 * (0.5 + 0.5 * sin(a)))
             let cy = h * (0.14 + 0.6 * (0.5 + 0.5 * cos(a * 2.1)))
-            if hypot(cx - cup.x, cy - cup.y) < 110 { continue }
-            if hypot(cx - tee.x, cy - tee.y) < 90 { continue }
+            if hypot(cx - cup.x, cy - cup.y) < 160 { continue }
+            if hypot(cx - tee.x, cy - tee.y) < 130 { continue }
             if i.isMultiple(of: 3) {
-                bumpers.append((CGPoint(x: cx, y: cy), 17))
+                bumpers.append((CGPoint(x: cx, y: cy), 34))
             } else if i.isMultiple(of: 2) {
-                sands.append((CGPoint(x: cx, y: cy), min(28 + CGFloat(holeNum) * 1.6, 44)))
+                sands.append((CGPoint(x: cx, y: cy), min(56 + CGFloat(holeNum) * 3, 88)))
             } else {
-                waters.append(CGRect(x: cx - 70, y: cy - 14, width: 140, height: 28))
+                waters.append(CGRect(x: cx - 140, y: cy - 28, width: 280, height: 56))
             }
         }
     }
@@ -258,6 +272,15 @@ final class GameView: NSView {
         vel = .zero
         sinkT = 0
         phase = .aim
+        onMoveHandle?(ball)
+        needsDisplay = true
+    }
+
+    func rebuildForScreens() {
+        guard phase == .aim else { return }
+        buildHole()
+        ball = tee
+        vel = .zero
         onMoveHandle?(ball)
         needsDisplay = true
     }
@@ -389,6 +412,34 @@ final class GameView: NSView {
     var onMoveHandle: ((NSPoint) -> Void)?
     var onInteractiveChange: ((Bool) -> Void)?
 
+    /// Global monitors as fallback for the swallowed-first-click problem: when the
+    /// handle view misses the mouseDown (macOS window activation eats it), the monitor
+    /// still sees the sequence and drives the shot. Guarded by seqActive so the two
+    /// input paths never double-fire.
+    func installGlobalMonitors() {
+        let md = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.phase == .aim, !self.seqActive else { return }
+                self.seqActive = true
+                self.handleGrab()
+            }
+        }
+        let mm = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .rightMouseDragged]) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.seqActive else { return }
+                self.handleDrag(NSEvent.mouseLocation)
+            }
+        }
+        let mu = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.seqActive else { return }
+                self.seqActive = false
+                self.handleRelease(NSEvent.mouseLocation)
+            }
+        }
+        monitors = [md, mm, mu].compactMap { $0 }
+    }
+
     func screenToLocal(_ sp: NSPoint) -> NSPoint {
         guard let w = window else { return sp }
         return w.convertFromScreen(NSRect(origin: sp, size: .zero)).origin
@@ -397,18 +448,20 @@ final class GameView: NSView {
     func handleGrab() {
         lastT = CACurrentMediaTime()
         link?.isPaused = false
+        seqActive = true
         NSCursor.closedHand.push()
     }
 
     func handleDrag(_ screenPoint: NSPoint) {
-        guard phase == .aim else { return }
+        guard phase == .aim, seqActive else { return }
         drag = screenToLocal(screenPoint)
         needsDisplay = true
     }
 
     func handleRelease(_ screenPoint: NSPoint) {
         NSCursor.pop()
-        guard phase == .aim else { return }
+        guard phase == .aim, seqActive else { return }
+        seqActive = false
         let d = screenToLocal(screenPoint)
         drag = nil
         let pull = ball - d
@@ -464,18 +517,18 @@ final class GameView: NSView {
         ctx.setFillColor(CGColor.rgb(0, 0, 0, 0.75))
         ctx.fillEllipse(in: CGRect(x: cup.x - Self.CUPR, y: cup.y - Self.CUPR, width: Self.CUPR * 2, height: Self.CUPR * 2))
         ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.55 + 0.25 * CGFloat(sin(t * 2.6))))
-        ctx.setLineWidth(2)
-        ctx.strokeEllipse(in: CGRect(x: cup.x - Self.CUPR - 4, y: cup.y - Self.CUPR - 4, width: (Self.CUPR + 4) * 2, height: (Self.CUPR + 4) * 2))
+        ctx.setLineWidth(3)
+        ctx.strokeEllipse(in: CGRect(x: cup.x - Self.CUPR - 5, y: cup.y - Self.CUPR - 5, width: (Self.CUPR + 5) * 2, height: (Self.CUPR + 5) * 2))
 
-        // flag
-        let fy = cup.y - 30
+        // flag (2x)
+        let fy = cup.y - 64
         ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.9))
-        ctx.setLineWidth(2)
+        ctx.setLineWidth(3)
         ctx.move(to: cup); ctx.addLine(to: CGPoint(x: cup.x, y: fy)); ctx.strokePath()
         let flag = CGMutablePath()
         flag.move(to: CGPoint(x: cup.x, y: fy))
-        flag.addLine(to: CGPoint(x: cup.x + 17, y: fy + 6))
-        flag.addLine(to: CGPoint(x: cup.x, y: fy + 12))
+        flag.addLine(to: CGPoint(x: cup.x + 36, y: fy + 12))
+        flag.addLine(to: CGPoint(x: cup.x, y: fy + 24))
         flag.closeSubpath()
         ctx.setFillColor(CGColor.rgb(1, 0.32, 0.28, 0.95))
         ctx.addPath(flag); ctx.fillPath()
@@ -483,12 +536,12 @@ final class GameView: NSView {
         // score chip under the cup
         let chip = "H\(holeNum) · Par \(par) · Str \(strokes) · Tot \(fmt(totalDiff))" + (best.map { " · Best \(fmt($0))" } ?? "")
         let chipAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold),
             .foregroundColor: NSColor.white.withAlphaComponent(0.8),
             .shadow: shadow(),
         ]
         let cs = (chip as NSString).size(withAttributes: chipAttrs)
-        (chip as NSString).draw(at: CGPoint(x: cup.x - cs.width / 2, y: cup.y + Self.CUPR + 12), withAttributes: chipAttrs)
+        (chip as NSString).draw(at: CGPoint(x: cup.x - cs.width / 2, y: cup.y + Self.CUPR + 14), withAttributes: chipAttrs)
 
         // splash rings
         if splashT > 0, let sp = splashAt {
@@ -591,6 +644,7 @@ final class HandleView: NSView {
     var onDrag: ((NSPoint) -> Void)?
     var onUp: ((NSPoint) -> Void)?
     var interactive = true
+    private var seqActive = false
 
     override var isOpaque: Bool { false }
     override func acceptsFirstMouse(for n: NSEvent?) -> Bool { true }
@@ -602,9 +656,18 @@ final class HandleView: NSView {
     required init?(coder: NSCoder) { fatalError() }
     override init(frame: NSRect) { super.init(frame: frame) }
 
-    override func mouseDown(with e: NSEvent) { onDown?() }
+    override func mouseDown(with e: NSEvent) {
+        window?.makeKey()
+        guard !seqActive else { return }
+        seqActive = true
+        onDown?()
+    }
     override func mouseDragged(with e: NSEvent) { onDrag?(NSEvent.mouseLocation) }
-    override func mouseUp(with e: NSEvent) { onUp?(NSEvent.mouseLocation) }
+    override func mouseUp(with e: NSEvent) {
+        guard seqActive else { return }
+        seqActive = false
+        onUp?(NSEvent.mouseLocation)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -613,12 +676,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var handlePanel: Panel!
     private var handleView: HandleView!
     private var statusItem: NSStatusItem!
-    private static let HANDLE: CGFloat = 120
+    private static let HANDLE: CGFloat = 170
+
+    private var screensUnion: NSRect {
+        var u = NSRect.null
+        for s in NSScreen.screens { u = u.union(s.frame) }
+        return u.isEmpty ? (NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1512, height: 982)) : u
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
+        let union = screensUnion
 
-        panel = Panel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = Panel(contentRect: union, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -628,11 +697,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = false
         panel.ignoresMouseEvents = true // overlay never eats clicks
 
-        game = GameView(frame: NSRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height))
+        game = GameView(frame: NSRect(x: 0, y: 0, width: union.width, height: union.height))
         game.wantsLayer = true
         game.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentView = game
         panel.orderFrontRegardless()
+        game.installGlobalMonitors()
 
         // handle window: the only interactive pixels (centered on the ball)
         let h = Self.HANDLE
@@ -682,15 +752,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func position() {
-        guard let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main else { return }
-        panel.setFrame(screen.frame, display: true)
-        game.frame = NSRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height)
+        let u = screensUnion
+        panel.setFrame(u, display: true)
+        game.frame = NSRect(x: 0, y: 0, width: u.width, height: u.height)
+        game.rebuildForScreens()
         moveHandle()
     }
 
     private func moveHandle() {
-        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main,
-              let w = game.window else { return }
+        guard let w = game.window else { return }
         let local = game.ball // view coords == window coords for the fullscreen overlay
         let screenPt = w.convertToScreen(NSRect(origin: local, size: .zero)).origin
         let h = Self.HANDLE
