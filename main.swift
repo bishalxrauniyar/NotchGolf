@@ -323,7 +323,9 @@ final class GameView: NSView {
         let inSand = sands.contains { $0.0.dist(to: p) < $0.1 }
         let damp = CGFloat(exp(-Double((inSand ? Self.SANDFRICTION : Self.FRICTION) * h)))
         v = v * damp
-        v = v + wind * h
+        // wind curves a moving shot but must never overpower friction — otherwise the
+        // ball would drift forever. Only apply above a crawl so the ball always stops.
+        if v.len > 60 { v = v + wind * h }
         if inSand && !sands.contains(where: { $0.0.dist(to: ball) < $0.1 }) { SFX.shared.sand() }
 
         if p.x - Self.BR < g.minX { p.x = g.minX + Self.BR; if v.x < 0 { if abs(v.x) > 60 { SFX.shared.wall() }; v.x = -v.x * Self.REST } }
@@ -366,7 +368,8 @@ final class GameView: NSView {
             return
         }
 
-        if v.len < 11 && wind.len < 40 {
+        // wind only acts above 60px/s, so friction always brings the ball to rest
+        if v.len < 12 {
             vel = .zero
             ball = p
             phase = .aim
