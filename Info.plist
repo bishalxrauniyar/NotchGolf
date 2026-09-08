@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.bishalrauniyar.notchgolf</string>
     <key>CFBundleVersion</key>
-    <string>1.0.8</string>
+    <string>1.0.9</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.8</string>
+    <string>1.0.9</string>
     <key>CFBundleExecutable</key>
     <string>NotchGolf</string>
     <key>CFBundlePackageType</key>
