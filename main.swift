@@ -193,8 +193,24 @@ final class GameView: NSView {
     private var link: CADisplayLink?
     private var isPaused = false
 
+    // Peek/expand UI: collapsed = mini view inside the notch; tapping expands downward
+    var collapsed = true
+    var onExpand: (() -> Void)?
+    var onCollapse: (() -> Void)?
+
     override var isOpaque: Bool { false }
     override var mouseDownCanMoveWindow: Bool { false }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        // rebuild hole layout for the new size, unless mid-shot
+        if phase == .aim || phase == .holeOver {
+            buildHole()
+            ball = tee
+            vel = .zero
+        }
+        needsDisplay = true
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -223,8 +239,14 @@ final class GameView: NSView {
         sands = []; waters = []; bumpers = []
         strokes = 0
 
-        tee = CGPoint(x: w * 0.12, y: h * 0.62)
-        cup = CGPoint(x: w * 0.86, y: h * 0.5)
+        // Layout adapts: collapsed peek = horizontal strip; expanded = full mini-golf below the notch
+        if h < 60 {
+            tee = CGPoint(x: w * 0.18, y: h * 0.55)
+            cup = CGPoint(x: w * 0.85, y: h * 0.5)
+        } else {
+            tee = CGPoint(x: w * 0.12, y: h * 0.62)
+            cup = CGPoint(x: w * 0.86, y: h * 0.5)
+        }
 
         par = holeNum <= 1 ? 2 : (holeNum <= 3 ? 3 : 4)
 
@@ -381,9 +403,19 @@ final class GameView: NSView {
     override func mouseDown(with e: NSEvent) {
         lastT = CACurrentMediaTime()
         link?.isPaused = false
+        let p = convert(e.locationInWindow, from: nil)
+
+        if collapsed {
+            onExpand?()
+            return
+        }
+        // grip at top-center of expanded panel collapses back into the notch
+        if p.y > bounds.height - 20 && abs(p.x - bounds.midX) < 36 {
+            onCollapse?()
+            return
+        }
         if phase == .holeOver { nextHole(); return }
         guard phase == .aim else { return }
-        let p = convert(e.locationInWindow, from: nil)
         if p.dist(to: ball) < 34 { drag = p }
     }
 
@@ -413,6 +445,11 @@ final class GameView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let g = bounds
         let t = CACurrentMediaTime()
+
+        if collapsed {
+            drawPeek(ctx, g, t)
+            return
+        }
 
         ctx.setFillColor(CGColor.rgb(0.07, 0.09, 0.08))
         ctx.fill(g)
@@ -545,6 +582,34 @@ final class GameView: NSView {
             (bannerSub as NSString).draw(at: CGPoint(x: (g.width - ss.width) / 2, y: g.midY - 16), withAttributes: sm)
         }
     }
+
+    // Mini fairway drawn when collapsed inside the notch
+    private func drawPeek(_ ctx: CGContext, _ g: CGRect, _ t: CFTimeInterval) {
+        ctx.setFillColor(CGColor.rgb(0.02, 0.02, 0.02))
+        ctx.fill(g)
+        ctx.setFillColor(CGColor.rgb(0.11, 0.4, 0.21))
+        ctx.fill(g.insetBy(dx: 2, dy: 2))
+
+        ctx.setFillColor(CGColor.rgb(0.02, 0.02, 0.02))
+        ctx.fillEllipse(in: CGRect(x: cup.x - 5, y: cup.y - 5, width: 10, height: 10))
+        ctx.setStrokeColor(CGColor.rgb(1, 1, 1, 0.9))
+        ctx.setLineWidth(1.5)
+        ctx.move(to: CGPoint(x: cup.x, y: cup.y - 4))
+        ctx.addLine(to: CGPoint(x: cup.x, y: cup.y - 16))
+        ctx.strokePath()
+        ctx.setFillColor(CGColor.rgb(1, 0.32, 0.28))
+        ctx.fill(CGRect(x: cup.x, y: cup.y - 16, width: 8, height: 5))
+
+        let pulse = CGFloat(1 + 0.15 * sin(t * 3))
+        ctx.setFillColor(CGColor.rgb(0.97, 0.97, 0.95))
+        ctx.fillEllipse(in: CGRect(x: ball.x - 5 * pulse, y: ball.y - 5 * pulse, width: 10 * pulse, height: 10 * pulse))
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.85),
+        ]
+        ("H\(holeNum) \(fmt(totalDiff))" as NSString).draw(at: CGPoint(x: 6, y: 3), withAttributes: attrs)
+    }
 }
 
 // MARK: - Panel + App
@@ -577,6 +642,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         game.layer?.backgroundColor = NSColor.clear.cgColor
         game.layer?.cornerRadius = 10
         game.layer?.masksToBounds = true
+        game.collapsed = true
+        game.onExpand = { [weak self] in self?.expand() }
+        game.onCollapse = { [weak self] in self?.collapse() }
         panel.contentView = game
         panel.orderFrontRegardless()
 
@@ -606,25 +674,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func notchRect(on screen: NSScreen) -> NSRect {
         let f = screen.frame
-        let top = screen.safeAreaInsets.top // includes menu bar + notch (0 on notchless Macs)
-        let menuH = NSStatusBar.system.thickness
-        let notchW: CGFloat = max(top > menuH + 1 ? screen.safeAreaInsets.left * 2 + 0 : 0, 185)
-        let probeH = top + 4
-        // measure the notch: walk the menu-bar strip for the dark gap in the screen screenshot-free way:
-        // safeAreaInsets on notched Macs = menu bar height; the notch width isn't exposed, so use Apple's 185–240pt range
-        let width = top > menuH + 1 ? notchWForScreen(f.width) : 185
-        return NSRect(x: f.midX - width / 2, y: f.maxY - top + 1, width: width, height: probeH - 2)
+        let top = screen.safeAreaInsets.top // menu bar + notch height
+        let width = top > NSStatusBar.system.thickness + 1 ? notchWForScreen(f.width) : 185
+        return NSRect(x: f.midX - width / 2, y: f.maxY - top + 1, width: width, height: top - 2)
     }
 
     private func notchWForScreen(_ logicalWidth: CGFloat) -> CGFloat {
-        // 14" ≈ 1512pt → ~200pt notch; 16" ≈ 1728pt → ~220pt notch
         logicalWidth >= 1700 ? 220 : 200
     }
 
-    private func position() {
-        let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
+    private func expandedRect(on screen: NSScreen) -> NSRect {
+        let f = screen.frame
         let notch = notchRect(on: screen)
-        panel.setFrame(notch, display: true)
+        let h: CGFloat = 300
+        return NSRect(x: notch.midX - notch.width / 2, y: f.maxY - h, width: notch.width, height: h)
+    }
+
+    private func expand() {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main else { return }
+        game.collapsed = false
+        game.needsDisplay = true
+        panel.setFrame(expandedRect(on: screen), display: true, animate: true)
+        NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+    }
+
+    private func collapse() {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main else { return }
+        game.collapsed = true
+        game.needsDisplay = true
+        panel.setFrame(notchRect(on: screen), display: true, animate: true)
+        game.newRound()
     }
 
     @objc private func toggleMenu() { toggle() }
@@ -634,6 +713,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu?.items.first(where: { $0.title == "Sound" })?.state = v ? .on : .off
     }
     @objc private func restart() { game.newRound() }
+
+    private func position() {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main else { return }
+        let rect = game.collapsed ? notchRect(on: screen) : expandedRect(on: screen)
+        panel.setFrame(rect, display: true)
+    }
+
     private func toggle() {
         if panel.isVisible { panel.orderOut(nil) } else { position(); panel.orderFrontRegardless() }
     }
