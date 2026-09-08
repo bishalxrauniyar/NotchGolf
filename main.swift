@@ -169,7 +169,7 @@ final class GameView: NSView {
     private var totalDiff = 0
     private var best: Int? = UserDefaults.standard.object(forKey: "notchgolf.best") as? Int
 
-    private var ball = CGPoint.zero
+    private(set) var ball = CGPoint.zero
     private var vel = CGPoint.zero
     private var preShot = CGPoint.zero
     private var cup = CGPoint.zero
@@ -214,18 +214,10 @@ final class GameView: NSView {
 
     // Only the ball is interactive — every other click falls through to apps below
     override func hitTest(_ p: NSPoint) -> NSView? {
-        guard let sup = superview else { return nil }
-        let local = convert(p, from: sup)
-        if phase == .aim && local.dist(to: ball) < Self.GRAB { return self }
-        return nil
+        return nil // the overlay window ignores events; a separate handle window near the ball handles input
     }
 
-    override func resetCursorRects() {
-        if phase == .aim {
-            addCursorRect(CGRect(x: ball.x - Self.GRAB, y: ball.y - Self.GRAB,
-                                 width: Self.GRAB * 2, height: Self.GRAB * 2), cursor: .openHand)
-        }
-    }
+    override func acceptsFirstMouse(for n: NSEvent?) -> Bool { true }
 
     // MARK: Hole generation — cup hangs under the notch, ball lands somewhere on the desktop
 
@@ -266,6 +258,7 @@ final class GameView: NSView {
         vel = .zero
         sinkT = 0
         phase = .aim
+        onMoveHandle?(ball)
         needsDisplay = true
     }
 
@@ -288,6 +281,9 @@ final class GameView: NSView {
 
         if splashT > 0 { splashT = max(0, splashT - CGFloat(dt * 2.2)) }
         if phase == .holeOver && now >= bannerUntil { nextHole() }
+
+        onMoveHandle?(ball)
+        onInteractiveChange?(phase == .aim && splashT == 0)
 
         needsDisplay = true
         l.isPaused = phase == .aim && drag == nil && splashT == 0 && now >= bannerUntil
@@ -388,28 +384,32 @@ final class GameView: NSView {
 
     private func fmt(_ d: Int) -> String { d == 0 ? "E" : "\(d)" }
 
-    // MARK: Input
+    // MARK: Input — driven by the HandleView (small window that follows the ball)
 
-    override func mouseDown(with e: NSEvent) {
-        lastT = CACurrentMediaTime()
-        link?.isPaused = false
-        guard phase == .aim else { return }
-        let p = convert(e.locationInWindow, from: nil)
-        if p.dist(to: ball) < Self.GRAB {
-            drag = p
-            NSCursor.closedHand.push()
-        }
+    var onMoveHandle: ((NSPoint) -> Void)?
+    var onInteractiveChange: ((Bool) -> Void)?
+
+    func screenToLocal(_ sp: NSPoint) -> NSPoint {
+        guard let w = window else { return sp }
+        return w.convertFromScreen(NSRect(origin: sp, size: .zero)).origin
     }
 
-    override func mouseDragged(with e: NSEvent) {
-        guard phase == .aim, drag != nil else { return }
-        drag = convert(e.locationInWindow, from: nil)
+    func handleGrab() {
+        lastT = CACurrentMediaTime()
+        link?.isPaused = false
+        NSCursor.closedHand.push()
+    }
+
+    func handleDrag(_ screenPoint: NSPoint) {
+        guard phase == .aim else { return }
+        drag = screenToLocal(screenPoint)
         needsDisplay = true
     }
 
-    override func mouseUp(with e: NSEvent) {
+    func handleRelease(_ screenPoint: NSPoint) {
         NSCursor.pop()
-        guard phase == .aim, let d = drag else { return }
+        guard phase == .aim else { return }
+        let d = screenToLocal(screenPoint)
         drag = nil
         let pull = ball - d
         let dist = min(pull.len, Self.MAXDRAG)
@@ -583,10 +583,37 @@ final class Panel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// Tiny always-on-top window that follows the ball and is the only interactive spot.
+/// Its center (~110px around the ball) captures the mouse; its outer ring ignores events,
+/// so surrounding clicks pass through to apps below.
+final class HandleView: NSView {
+    var onDown: (() -> Void)?
+    var onDrag: ((NSPoint) -> Void)?
+    var onUp: ((NSPoint) -> Void)?
+    var interactive = true
+
+    override var isOpaque: Bool { false }
+    override func acceptsFirstMouse(for n: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ p: NSPoint) -> NSView? {
+        interactive ? self : nil
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+    override init(frame: NSRect) { super.init(frame: frame) }
+
+    override func mouseDown(with e: NSEvent) { onDown?() }
+    override func mouseDragged(with e: NSEvent) { onDrag?(NSEvent.mouseLocation) }
+    override func mouseUp(with e: NSEvent) { onUp?(NSEvent.mouseLocation) }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: Panel!
     private var game: GameView!
+    private var handlePanel: Panel!
+    private var handleView: HandleView!
     private var statusItem: NSStatusItem!
+    private static let HANDLE: CGFloat = 120
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
@@ -599,13 +626,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = false
-        panel.ignoresMouseEvents = false
+        panel.ignoresMouseEvents = true // overlay never eats clicks
 
         game = GameView(frame: NSRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height))
         game.wantsLayer = true
         game.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentView = game
         panel.orderFrontRegardless()
+
+        // handle window: the only interactive pixels (centered on the ball)
+        let h = Self.HANDLE
+        handlePanel = Panel(contentRect: NSRect(x: 0, y: 0, width: h, height: h),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        handlePanel.level = .statusBar + 1
+        handlePanel.isOpaque = false
+        handlePanel.backgroundColor = .clear
+        handlePanel.hasShadow = false
+        handlePanel.hidesOnDeactivate = false
+        handlePanel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        handlePanel.ignoresMouseEvents = false
+
+        handleView = HandleView(frame: NSRect(x: 0, y: 0, width: h, height: h))
+        handleView.onDown = { [weak self] in self?.game.handleGrab() }
+        handleView.onDrag = { [weak self] pt in self?.game.handleDrag(pt) }
+        handleView.onUp = { [weak self] pt in self?.game.handleRelease(pt) }
+        handlePanel.contentView = handleView
+        handlePanel.orderFrontRegardless()
+        moveHandle()
+
+        game.onMoveHandle = { [weak self] _ in self?.moveHandle() }
+        game.onInteractiveChange = { [weak self] on in self?.handleView.interactive = on }
 
         HotKey.register()
         HotKey.onToggle = { [weak self] in self?.toggle() }
@@ -635,6 +685,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main else { return }
         panel.setFrame(screen.frame, display: true)
         game.frame = NSRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height)
+        moveHandle()
+    }
+
+    private func moveHandle() {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main,
+              let w = game.window else { return }
+        let local = game.ball // view coords == window coords for the fullscreen overlay
+        let screenPt = w.convertToScreen(NSRect(origin: local, size: .zero)).origin
+        let h = Self.HANDLE
+        handlePanel.setFrameOrigin(NSPoint(x: screenPt.x - h / 2, y: screenPt.y - h / 2))
     }
 
     @objc private func toggleMenu() { toggle() }
