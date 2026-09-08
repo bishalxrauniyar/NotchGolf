@@ -179,6 +179,7 @@ final class GameView: NSView {
     private var bumpers: [(CGPoint, CGFloat)] = []
 
     private var drag: CGPoint?
+    private var wind = CGPoint.zero
     private var sinkT: CGFloat = 0
     private var sinkFrom = CGPoint.zero
     private var splashAt: CGPoint?
@@ -245,7 +246,12 @@ final class GameView: NSView {
 
         par = holeNum <= 1 ? 2 : (holeNum <= 3 ? 3 : 4)
 
-        let count = min(holeNum / 2 + 1, 6)
+        // per-hole wind: grows every level, changes direction
+        let wmag = holeNum <= 1 ? CGFloat(0) : min(CGFloat(holeNum) * 22, 140)
+        let wang = CGFloat(holeNum) * 1.4
+        wind = CGPoint(x: cos(wang) * wmag, y: sin(wang) * wmag)
+
+        let count = min(holeNum / 2 + 2, 8)
         for i in 0..<count {
             let a = CGFloat(i + 1) * 1.7 + CGFloat(holeNum) * 0.9
             let cx = w * (0.15 + 0.7 * (0.5 + 0.5 * sin(a)))
@@ -317,6 +323,7 @@ final class GameView: NSView {
         let inSand = sands.contains { $0.0.dist(to: p) < $0.1 }
         let damp = CGFloat(exp(-Double((inSand ? Self.SANDFRICTION : Self.FRICTION) * h)))
         v = v * damp
+        v = v + wind * h
         if inSand && !sands.contains(where: { $0.0.dist(to: ball) < $0.1 }) { SFX.shared.sand() }
 
         if p.x - Self.BR < g.minX { p.x = g.minX + Self.BR; if v.x < 0 { if abs(v.x) > 60 { SFX.shared.wall() }; v.x = -v.x * Self.REST } }
@@ -349,7 +356,9 @@ final class GameView: NSView {
             }
         }
 
-        if p.dist(to: cup) < Self.CUPR && v.len < Self.CATCH {
+        // cup gets pickier each hole: fast putts lip out
+        let catchSpeed = max(360, Self.CATCH - CGFloat(holeNum) * 20)
+        if p.dist(to: cup) < Self.CUPR && v.len < catchSpeed {
             sinkFrom = p
             sinkT = 0
             phase = .sink
@@ -357,7 +366,7 @@ final class GameView: NSView {
             return
         }
 
-        if v.len < 11 {
+        if v.len < 11 && wind.len < 40 {
             vel = .zero
             ball = p
             phase = .aim
@@ -409,32 +418,54 @@ final class GameView: NSView {
     var onMoveHandle: ((NSPoint) -> Void)?
     var onInteractiveChange: ((Bool) -> Void)?
 
-    /// Global monitors as fallback for the swallowed-first-click problem: when the
-    /// handle view misses the mouseDown (macOS window activation eats it), the monitor
-    /// still sees the sequence and drives the shot. Guarded by seqActive so the two
-    /// input paths never double-fire.
+    /// Local monitor sees every event routed to our app (before window dispatch), so it
+    /// catches clicks even when the handle window misses them. Global monitors cover the
+    /// rest and can recover a gesture whose mouseDown was swallowed by activation.
+    /// All paths are guarded by seqActive + ball proximity so they never double-fire
+    /// or start phantom grabs on unrelated clicks.
     func installGlobalMonitors() {
-        let md = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .rightMouseDragged, .rightMouseUp]
+
+        let local = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] e in
+            guard let self else { return e }
             DispatchQueue.main.async {
-                guard let self, self.phase == .aim, !self.seqActive else { return }
-                self.seqActive = true
-                self.handleGrab()
+                let near = self.screenToLocal(NSEvent.mouseLocation).dist(to: self.ball) < Self.GRAB
+                switch e.type {
+                case .leftMouseDown, .rightMouseDown:
+                    if self.phase == .aim, near, !self.seqActive { self.handleGrab() }
+                case .leftMouseDragged, .rightMouseDragged:
+                    if self.seqActive { self.handleDrag(NSEvent.mouseLocation) }
+                case .leftMouseUp, .rightMouseUp:
+                    if self.seqActive { self.seqActive = false; self.handleRelease(NSEvent.mouseLocation) }
+                default: break
+                }
+            }
+            return e
+        }
+
+        let global = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] e in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let near = self.screenToLocal(NSEvent.mouseLocation).dist(to: self.ball) < Self.GRAB
+                switch e.type {
+                case .leftMouseDown, .rightMouseDown:
+                    if self.phase == .aim, near, !self.seqActive { self.handleGrab() }
+                case .leftMouseDragged, .rightMouseDragged:
+                    // mid-gesture recovery: mouseDown was swallowed, but a drag starting
+                    // near the ball re-enters the sequence
+                    if self.phase == .aim, near, !self.seqActive {
+                        self.handleGrab()
+                        self.handleDrag(NSEvent.mouseLocation)
+                    } else if self.seqActive {
+                        self.handleDrag(NSEvent.mouseLocation)
+                    }
+                case .leftMouseUp, .rightMouseUp:
+                    if self.seqActive { self.seqActive = false; self.handleRelease(NSEvent.mouseLocation) }
+                default: break
+                }
             }
         }
-        let mm = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .rightMouseDragged]) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.seqActive else { return }
-                self.handleDrag(NSEvent.mouseLocation)
-            }
-        }
-        let mu = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.seqActive else { return }
-                self.seqActive = false
-                self.handleRelease(NSEvent.mouseLocation)
-            }
-        }
-        monitors = [md, mm, mu].compactMap { $0 }
+        monitors = [local, global].compactMap { $0 }
     }
 
     func screenToLocal(_ sp: NSPoint) -> NSPoint {
@@ -532,6 +563,24 @@ final class GameView: NSView {
 
         // score chip under the cup
         let chip = "H\(holeNum) · Par \(par) · Str \(strokes) · Tot \(fmt(totalDiff))" + (best.map { " · Best \(fmt($0))" } ?? "")
+        if wind.len > 1 {
+            // wind arrow above the cup: length = strength
+            ctx.saveGState()
+            ctx.translateBy(x: cup.x, y: cup.y + Self.CUPR + 40)
+            ctx.rotate(by: atan2(wind.y, wind.x))
+            ctx.setStrokeColor(CGColor.rgb(1, 0.95, 0.5, 0.85))
+            ctx.setLineWidth(3)
+            ctx.setLineCap(.round)
+            ctx.move(to: CGPoint(x: -16, y: 0)); ctx.addLine(to: CGPoint(x: 16, y: 0)); ctx.strokePath()
+            let head = CGMutablePath()
+            head.move(to: CGPoint(x: 24, y: 0))
+            head.addLine(to: CGPoint(x: 13, y: 6))
+            head.addLine(to: CGPoint(x: 13, y: -6))
+            head.closeSubpath()
+            ctx.setFillColor(CGColor.rgb(1, 0.95, 0.5, 0.85))
+            ctx.addPath(head); ctx.fillPath()
+            ctx.restoreGState()
+        }
         let chipAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold),
             .foregroundColor: NSColor.white.withAlphaComponent(0.8),
